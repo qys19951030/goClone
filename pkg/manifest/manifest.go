@@ -357,6 +357,18 @@ func (m *Manifest) Get(url string) (Record, bool) {
 	return r, ok
 }
 
+// Snapshot returns a copy of every current record (one per distinct URL). It lets the
+// crawler seed resume-run statistics without holding the manifest lock during a crawl.
+func (m *Manifest) Snapshot() []Record {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]Record, 0, len(m.records))
+	for _, r := range m.records {
+		out = append(out, r)
+	}
+	return out
+}
+
 // Close flushes every queued record, stops the writer and closes the file. The first
 // persistent writer error, if any, is returned so the caller can end the run as failed.
 // Close is idempotent: repeated calls return the same outcome.

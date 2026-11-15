@@ -87,6 +87,24 @@ func cloneSite(ctx context.Context, args []string, flag Flags, summary *os.File)
 	}
 	defer func() { man = nil }()
 
+	// Seed resume-run accounting from disk: every success record counts as a skip up
+	// front; items processed again below are added on top, so the two never overlap.
+	resumePages := 0
+	for _, r := range man.Snapshot() {
+		if r.Status != manifest.StatusSuccess {
+			continue
+		}
+		switch r.Type {
+		case manifest.TypePage:
+			resumePages++
+		case manifest.TypeCSS, manifest.TypeJS, manifest.TypeImg, manifest.TypeFont:
+			runStats.assetSkipped(r.Type)
+		}
+	}
+	for range resumePages {
+		runStats.pageSkipped()
+	}
+
 	geziyorOptions := &geziyor.Options{
 		AllowedDomains:    []string{projectURL.Host},
 		StartURLs:         []string{u.String()},
@@ -101,15 +119,15 @@ func cloneSite(ctx context.Context, args []string, flag Flags, summary *os.File)
 	}
 	if flag.BrowserEndpoint != "" {
 		geziyorOptions.BrowserEndpoint = flag.BrowserEndpoint
-		geziyorOptions.StartRequestsFunc = func(g *geziyor.Geziyor) {
-			getPageIfNeeded(g, u.String(), g.Opt.ParseFunc)
+	}
+	// Enumerate every page known to the manifest, not just the user's start URL:
+	// successful ones are counted as skips at the gate, failed/unknown pages re-enter
+	// the crawl so resume works even when the start URL was already complete.
+	geziyorOptions.StartRequestsFunc = func(g *geziyor.Geziyor) {
+		for _, pageURL := range startPageURLs(u.String()) {
+			getPageIfNeeded(g, pageURL, g.Opt.ParseFunc)
 		}
-	} else {
-		geziyorOptions.StartRequestsFunc = func(g *geziyor.Geziyor) {
-			for _, startURL := range g.Opt.StartURLs {
-				getPageIfNeeded(g, startURL, g.Opt.ParseFunc)
-			}
-		}
+		retryFailedAssets(g)
 	}
 
 	geziyor.NewGeziyor(geziyorOptions).Start()
@@ -176,11 +194,48 @@ func cloneSite(ctx context.Context, args []string, flag Flags, summary *os.File)
 // success record for it, so resumed runs never re-request completed pages.
 func getPageIfNeeded(g *geziyor.Geziyor, pageURL string, callback func(*geziyor.Geziyor, *client.Response)) {
 	if man != nil && man.IsSuccess(pageURL) {
-		runStats.pageSkipped()
 		fmt.Fprintf(os.Stderr, "page skipped (already complete) --> %s\n", pageURL)
 		return
 	}
 	g.Get(pageURL, callback)
+}
+
+// startPageURLs returns the pages to feed into the crawl: every page record already
+// known to the manifest (so resume re-attempts previously failed pages), with the
+// user-supplied start URL guaranteed first even when no manifest exists yet.
+func startPageURLs(startURL string) []string {
+	seen := map[string]bool{startURL: true}
+	pages := []string{startURL}
+	if man != nil {
+		for _, r := range man.Snapshot() {
+			if r.Type != manifest.TypePage || seen[r.URL] {
+				continue
+			}
+			seen[r.URL] = true
+			pages = append(pages, r.URL)
+		}
+	}
+	return pages
+}
+
+// retryFailedAssets re-queues every asset whose latest manifest record is a failure:
+// stylesheets re-enter the geziyor parse pipeline, the other kinds go straight back
+// through the download gate. Without this, skipped pages would never re-discover them.
+func retryFailedAssets(g *geziyor.Geziyor) {
+	if man == nil {
+		return
+	}
+	for _, r := range man.Snapshot() {
+		if r.Status != manifest.StatusFailed {
+			continue
+		}
+		switch r.Type {
+		case manifest.TypeCSS:
+			scheduleCSS(g, r.URL)
+		case manifest.TypeJS, manifest.TypeImg, manifest.TypeFont:
+			scheduleAsset(r.Type, r.URL)
+		}
+	}
 }
 
 // printSummary writes the run summary to out (stdout in production) and nowhere near
