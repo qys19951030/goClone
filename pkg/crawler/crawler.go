@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
@@ -21,17 +22,30 @@ import (
 	"github.com/geziyor/geziyor/client"
 
 	"github.com/shurco/goClone/pkg/fsutil"
+	"github.com/shurco/goClone/pkg/manifest"
 	"github.com/shurco/goClone/pkg/netutil"
 )
+
+// ManifestFileName is the JSON Lines manifest stored inside every mirror directory.
+const ManifestFileName = "manifest.jsonl"
 
 // CloneSite downloads the site at args[0] (a valid absolute http or https URL) into
 // ./<host>/ relative to the process working directory. flag configures proxy, User-Agent,
 // cookies, robots.txt handling, optional headless Chrome rendering, asset root, download
 // limits, logging, and whether to open the mirror or serve it over HTTP.
 //
+// Before any request is made, the mirror's manifest is opened and read back: pages and
+// assets already recorded as successful are skipped, while failed and unknown items are
+// processed. A manifest that cannot be opened or written fails the run up front — the
+// crawler never silently degrades to a manifest-less run.
+//
 // The crawl itself does not honour ctx cancellation (Geziyor limitation); ctx is used
 // for asset downloads and, when Serve is true, for graceful HTTP server shutdown.
 func CloneSite(ctx context.Context, args []string, flag Flags) error {
+	return cloneSite(ctx, args, flag, os.Stdout)
+}
+
+func cloneSite(ctx context.Context, args []string, flag Flags, summary *os.File) error {
 	if len(args) < 1 {
 		return fmt.Errorf("url is required")
 	}
@@ -59,6 +73,19 @@ func CloneSite(ctx context.Context, args []string, flag Flags) error {
 	projectURL = u
 	projectPath = filepath.Join(fsutil.Workdir(), projectURL.Host)
 	files = filesBase{}
+	runStats = newStats()
+	resetDefaultRewriter()
+
+	// Fail before crawling when the mirror directory or manifest are unusable.
+	if fi, statErr := os.Stat(projectPath); statErr == nil && !fi.IsDir() {
+		return fmt.Errorf("mirror path %s is not a directory", projectPath)
+	}
+	manifestPath := filepath.Join(projectPath, ManifestFileName)
+	man, err = manifest.Open(ctx, manifestPath)
+	if err != nil {
+		return err
+	}
+	defer func() { man = nil }()
 
 	geziyorOptions := &geziyor.Options{
 		AllowedDomains:    []string{projectURL.Host},
@@ -75,7 +102,13 @@ func CloneSite(ctx context.Context, args []string, flag Flags) error {
 	if flag.BrowserEndpoint != "" {
 		geziyorOptions.BrowserEndpoint = flag.BrowserEndpoint
 		geziyorOptions.StartRequestsFunc = func(g *geziyor.Geziyor) {
-			g.GetRendered(u.String(), g.Opt.ParseFunc)
+			getPageIfNeeded(g, u.String(), g.Opt.ParseFunc)
+		}
+	} else {
+		geziyorOptions.StartRequestsFunc = func(g *geziyor.Geziyor) {
+			for _, startURL := range g.Opt.StartURLs {
+				getPageIfNeeded(g, startURL, g.Opt.ParseFunc)
+			}
 		}
 	}
 
@@ -90,20 +123,26 @@ func CloneSite(ctx context.Context, args []string, flag Flags) error {
 		empty := len(files.pages) == 0 && len(files.css) == 0 && len(files.js) == 0 && len(files.img) == 0 && len(files.font) == 0
 		filesMu.Unlock()
 		if empty {
-			fmt.Println("Hint: JS rendering returned no content. If you run Chrome inside Docker on Linux and see ERR_CONNECTION_REFUSED or ERR_NAME_NOT_RESOLVED:")
-			fmt.Println(" - Run Chrome with host networking: docker run --net=host --rm -d --name headless chromedp/headless-shell:stable")
-			fmt.Println(" - Or serve a URL reachable from the container (use host IP or a shared Docker network)")
-			fmt.Println(" - Ensure you pass the full DevTools WS URL from /json/version when needed")
+			fmt.Fprintln(os.Stderr, "Hint: JS rendering returned no content. If you run Chrome inside Docker on Linux and see ERR_CONNECTION_REFUSED or ERR_NAME_NOT_RESOLVED:")
+			fmt.Fprintln(os.Stderr, " - Run Chrome with host networking: docker run --net=host --rm -d --name headless chromedp/headless-shell:stable")
+			fmt.Fprintln(os.Stderr, " - Or serve a URL reachable from the container (use host IP or a shared Docker network)")
+			fmt.Fprintln(os.Stderr, " - Ensure you pass the full DevTools WS URL from /json/version when needed")
 		}
 	}
 
-	filesMu.Lock()
-	fmt.Printf("Pages: %v\n", len(files.pages))
-	fmt.Printf("CSS files: %v\n", len(files.css))
-	fmt.Printf("JS files: %v\n", len(files.js))
-	fmt.Printf("Img files: %v\n", len(files.img))
-	fmt.Printf("Font files: %v\n", len(files.font))
-	filesMu.Unlock()
+	printSummary(summary)
+
+	// A manifest write failure means records were lost: the run must end as failed.
+	// Close is idempotent, so the deferred reset above stays safe.
+	if manifestErr := man.Err(); manifestErr != nil {
+		if closeErr := man.Close(); closeErr != nil && !errors.Is(closeErr, manifestErr) {
+			return fmt.Errorf("manifest failure: %w (close: %v)", manifestErr, closeErr)
+		}
+		return fmt.Errorf("manifest failure: %w", manifestErr)
+	}
+	if closeErr := man.Close(); closeErr != nil {
+		return fmt.Errorf("manifest close: %w", closeErr)
+	}
 
 	if flag.Open {
 		openURL := projectPath + "/index.html"
@@ -133,8 +172,41 @@ func CloneSite(ctx context.Context, args []string, flag Flags) error {
 	return nil
 }
 
-// processSrcset rewrites all URLs inside a srcset-like attribute value and triggers downloads.
-func processSrcset(attr string, body string, join func(string) string) string {
+// getPageIfNeeded enqueues a page only when the manifest does not already hold a
+// success record for it, so resumed runs never re-request completed pages.
+func getPageIfNeeded(g *geziyor.Geziyor, pageURL string, callback func(*geziyor.Geziyor, *client.Response)) {
+	if man != nil && man.IsSuccess(pageURL) {
+		runStats.pageSkipped()
+		fmt.Fprintf(os.Stderr, "page skipped (already complete) --> %s\n", pageURL)
+		return
+	}
+	g.Get(pageURL, callback)
+}
+
+// printSummary writes the run summary to out (stdout in production) and nowhere near
+// the progress chatter, which lives on stderr.
+func printSummary(out *os.File) {
+	pagesNew, pagesSkipped, _, newN, skippedN, failedN, failedByType := runStats.snapshot()
+
+	fmt.Fprintln(out, "Crawl summary:")
+	fmt.Fprintf(out, "  pages: new=%d skipped=%d\n", pagesNew, pagesSkipped)
+	fmt.Fprintf(out, "  assets: new=%d skipped=%d failed=%d\n", newN, skippedN, failedN)
+	fmt.Fprintf(out, "  manifest entries (cumulative): %d\n", man.Count())
+	if len(failedByType) == 0 {
+		fmt.Fprintln(out, "  failures by type: none")
+		return
+	}
+	fmt.Fprintln(out, "  failures by type:")
+	for _, kind := range []string{manifest.TypePage, manifest.TypeCSS, manifest.TypeJS, manifest.TypeImg, manifest.TypeFont} {
+		if n := failedByType[kind]; n > 0 {
+			fmt.Fprintf(out, "    %s: %d\n", kind, n)
+		}
+	}
+}
+
+// processSrcset rewrites all URLs inside a srcset-like attribute value and triggers
+// downloads through the manifest gate.
+func processSrcset(rw *linkRewriter, attr string, body string, join func(string) string) string {
 	if strings.TrimSpace(attr) == "" {
 		return body
 	}
@@ -145,15 +217,18 @@ func processSrcset(attr string, body string, join func(string) string) string {
 		}
 		origURL, _, _ := strings.Cut(p, " ")
 		abs := join(origURL)
-		body = saveAsset("img", abs, origURL, body)
+		body = saveAssetWith(rw, "img", abs, origURL, body)
 	}
 	return body
 }
 
 func quotesParse(g *geziyor.Geziyor, r *client.Response) {
 	body := string(r.Body)
+	pageURL := r.Request.URL.String()
 	urlPath := r.Response.Request.URL.Path
-	fmt.Printf("page: %s://%s%s\n", projectURL.Scheme, projectURL.Host, urlPath)
+	fmt.Fprintf(os.Stderr, "page: %s://%s%s\n", projectURL.Scheme, projectURL.Host, urlPath)
+
+	rw := newLinkRewriter()
 
 	// CSS files
 	r.HTMLDoc.Find("link[rel='stylesheet']").Each(func(i int, s *goquery.Selection) {
@@ -164,15 +239,16 @@ func quotesParse(g *geziyor.Geziyor, r *client.Response) {
 		abs := r.JoinURL(data)
 		parsedURL, err := url.Parse(abs)
 		if err != nil {
-			fmt.Println("Error parsing URL:", err)
+			fmt.Fprintln(os.Stderr, "Error parsing URL:", err)
 			return
 		}
 		if parsedURL.Host == projectURL.Host || parsedURL.Host == "" {
-			if addAsset("css", abs) {
-				fmt.Println("Css found", "-->", abs)
-				g.Get(r.JoinURL(abs), parseCSS)
+			scheduleCSS(g, abs)
+			newLink, err := rw.rewrite(abs)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				return
 			}
-			newLink := "/" + netutil.Folders["css"] + "/" + netutil.ReplaceSlashWithDash(parsedURL.Path)
 			body = strings.ReplaceAll(body, data, newLink)
 		}
 	})
@@ -180,10 +256,10 @@ func quotesParse(g *geziyor.Geziyor, r *client.Response) {
 	// JS files
 	r.HTMLDoc.Find("script[src],script[data-rocket-src]").Each(func(i int, s *goquery.Selection) {
 		if data, exists := s.Attr("src"); exists {
-			body = saveAsset("js", r.JoinURL(data), data, body)
+			body = saveAssetWith(rw, "js", r.JoinURL(data), data, body)
 		}
 		if data1, exists1 := s.Attr("data-rocket-src"); exists1 {
-			body = saveAsset("js", r.JoinURL(data1), data1, body)
+			body = saveAssetWith(rw, "js", r.JoinURL(data1), data1, body)
 		}
 	})
 
@@ -197,53 +273,55 @@ func quotesParse(g *geziyor.Geziyor, r *client.Response) {
 		abs := r.JoinURL(data)
 		switch as {
 		case "font":
-			body = saveAsset("font", abs, data, body)
+			body = saveAssetWith(rw, "font", abs, data, body)
 		case "image":
-			body = saveAsset("img", abs, data, body)
+			body = saveAssetWith(rw, "img", abs, data, body)
 		case "script":
-			body = saveAsset("js", abs, data, body)
+			body = saveAssetWith(rw, "js", abs, data, body)
 		case "style":
 			parsedURL, err := url.Parse(abs)
 			if err == nil && (parsedURL.Host == projectURL.Host || parsedURL.Host == "") {
-				if addAsset("css", abs) {
-					g.Get(r.JoinURL(abs), parseCSS)
+				scheduleCSS(g, abs)
+				newLink, err := rw.rewrite(abs)
+				if err != nil {
+					fmt.Fprintln(os.Stderr, err)
+					return
 				}
-				newLink := "/" + netutil.Folders["css"] + "/" + netutil.ReplaceSlashWithDash(parsedURL.Path)
 				body = strings.ReplaceAll(body, data, newLink)
 			}
 		default:
-			body = saveAsset("js", abs, data, body)
+			body = saveAssetWith(rw, "js", abs, data, body)
 		}
 	})
 
 	// Images and lazy variants
 	r.HTMLDoc.Find("img[src],img[data-lazy-src],img[data-lazy-srcset],img[srcset]").Each(func(i int, s *goquery.Selection) {
 		if v, ok := s.Attr("data-lazy-srcset"); ok {
-			body = processSrcset(v, body, r.JoinURL)
+			body = processSrcset(rw, v, body, r.JoinURL)
 		}
 		if v, ok := s.Attr("data-lazy-src"); ok {
-			body = saveAsset("img", r.JoinURL(v), v, body)
+			body = saveAssetWith(rw, "img", r.JoinURL(v), v, body)
 		}
 		if v, ok := s.Attr("srcset"); ok {
-			body = processSrcset(v, body, r.JoinURL)
+			body = processSrcset(rw, v, body, r.JoinURL)
 		}
 		if v, ok := s.Attr("src"); ok {
 			parsed, err := url.Parse(v)
 			if err != nil {
-				fmt.Println("Error parsing URL:", err)
+				fmt.Fprintln(os.Stderr, "Error parsing URL:", err)
 				return
 			}
 			if parsed.Scheme == "data" || parsed.Scheme == "blob" {
 				return
 			}
-			body = saveAsset("img", r.JoinURL(v), v, body)
+			body = saveAssetWith(rw, "img", r.JoinURL(v), v, body)
 		}
 	})
 
 	// picture <source srcset>
 	r.HTMLDoc.Find("picture source[srcset]").Each(func(i int, s *goquery.Selection) {
 		if v, ok := s.Attr("srcset"); ok {
-			body = processSrcset(v, body, r.JoinURL)
+			body = processSrcset(rw, v, body, r.JoinURL)
 		}
 	})
 
@@ -259,18 +337,18 @@ func quotesParse(g *geziyor.Geziyor, r *client.Response) {
 		}
 		inner.Find("img[src],img[srcset],source[srcset]").Each(func(j int, im *goquery.Selection) {
 			if v, ok := im.Attr("srcset"); ok {
-				body = processSrcset(v, body, r.JoinURL)
+				body = processSrcset(rw, v, body, r.JoinURL)
 			}
 			if v, ok := im.Attr("src"); ok {
 				parsed, err := url.Parse(v)
 				if err != nil {
-					fmt.Println("Error parsing URL:", err)
+					fmt.Fprintln(os.Stderr, "Error parsing URL:", err)
 					return
 				}
 				if parsed.Scheme == "data" || parsed.Scheme == "blob" {
 					return
 				}
-				body = saveAsset("img", r.JoinURL(v), v, body)
+				body = saveAssetWith(rw, "img", r.JoinURL(v), v, body)
 			}
 		})
 	})
@@ -278,11 +356,11 @@ func quotesParse(g *geziyor.Geziyor, r *client.Response) {
 	// Inline CSS blocks
 	r.HTMLDoc.Find("style").Each(func(i int, s *goquery.Selection) {
 		data := s.Text()
-		body = readCSS(data, body, r.Response.Request.URL)
+		body = readCSSWith(rw, data, body, r.Response.Request.URL)
 	})
 
-	// Links to other pages — schedule g.Get immediately when a new page is discovered
-	// to avoid the O(n²) pattern of re-queuing all known pages at the end of each call.
+	// Links to other pages — schedule immediately when the manifest allows the claim,
+	// so resumed runs do not re-request pages already completed on disk.
 	r.HTMLDoc.Find("a").Each(func(i int, s *goquery.Selection) {
 		data, exists := s.Attr("href")
 		if !exists {
@@ -290,18 +368,19 @@ func quotesParse(g *geziyor.Geziyor, r *client.Response) {
 		}
 		parsedURL, err := url.Parse(data)
 		if err != nil {
-			fmt.Println("Error parsing URL:", err)
+			fmt.Fprintln(os.Stderr, "Error parsing URL:", err)
 			return
 		}
 		if (parsedURL.Host == projectURL.Host || parsedURL.Host == "") && parsedURL.Path != "/" {
-			if addAsset("pages", parsedURL.Path) {
-				g.Get(r.JoinURL(data), quotesParse)
+			nextURL := r.JoinURL(data)
+			if addAsset("pages", nextURL) {
+				getPageIfNeeded(g, nextURL, quotesParse)
 			}
 		}
 	})
 
 	if urlPath == "" {
-		addAsset("pages", urlPath)
+		addAsset("pages", pageURL)
 	}
 
 	// Write page to disk
@@ -312,15 +391,71 @@ func quotesParse(g *geziyor.Geziyor, r *client.Response) {
 	} else {
 		filePath = filepath.Join(projectPath, cleanURLPath, "index.html")
 	}
+	relPath := pageRelPath(filePath)
+
 	index, err := fsutil.OpenFile(filePath, fsutil.FsCWTFlags, 0o666)
 	if err != nil {
 		log.Printf("quotesParse: open %s: %v", filePath, err)
+		recordPage(pageURL, relPath, manifest.StatusFailed)
 		return
 	}
 	body = strings.ReplaceAll(body, domain, "")
 	if _, err := fsutil.WriteOSFile(index, body); err != nil {
 		log.Printf("quotesParse: write %s: %v", filePath, err)
+		recordPage(pageURL, relPath, manifest.StatusFailed)
+		return
 	}
+	recordPage(pageURL, relPath, manifest.StatusSuccess)
+}
+
+// scheduleCSS fetches a stylesheet through the manifest gate: a CSS already successful
+// on disk is neither re-requested nor re-counted as new.
+func scheduleCSS(g *geziyor.Geziyor, abs string) {
+	if !addAsset("css", abs) {
+		return
+	}
+	if man != nil {
+		if !man.Claim(abs) {
+			if man.IsSuccess(abs) {
+				runStats.assetSkipped("css")
+				fmt.Fprintf(os.Stderr, "css skipped (already complete) --> %s\n", abs)
+			}
+			return
+		}
+	}
+	fmt.Fprintf(os.Stderr, "css found --> %s\n", abs)
+	g.Get(abs, parseCSS)
+}
+
+// recordPage stores the page outcome in the manifest and counts it once. Pages already
+// read back as successful from disk are never parsed again, so every success record
+// written here is a new or retried page of this run.
+func recordPage(pageURL, relPath, status string) {
+	if man == nil {
+		return
+	}
+	if err := man.Put(manifest.Record{
+		URL:    pageURL,
+		Type:   manifest.TypePage,
+		Path:   relPath,
+		Status: status,
+	}); err != nil {
+		log.Printf("manifest record lost for %s: %v", pageURL, err)
+	}
+	if status == manifest.StatusSuccess {
+		runStats.pageNew()
+	} else {
+		runStats.pageFailed()
+	}
+}
+
+// pageRelPath returns the mirror-relative path of an absolute page file path.
+func pageRelPath(abs string) string {
+	rel, err := filepath.Rel(projectPath, abs)
+	if err != nil {
+		return abs
+	}
+	return filepath.ToSlash(rel)
 }
 
 // open opens the specified URL in the default browser of the user.

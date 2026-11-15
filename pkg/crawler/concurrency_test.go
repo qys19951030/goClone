@@ -18,6 +18,8 @@ func Test_DownloadConcurrencyLimit(t *testing.T) {
 	projectPath = t.TempDir()
 	crawlCtx = t.Context()
 	files = filesBase{}
+	runStats = newStats()
+	resetDefaultRewriter()
 
 	// Server that tracks concurrent in-flight requests.
 	var inflight int32
@@ -45,7 +47,7 @@ func Test_DownloadConcurrencyLimit(t *testing.T) {
 	for range jobs {
 		wg.Go(func() {
 			link := ts.URL + "/img/file" + time.Now().Format("150405.000") + ".png"
-			downloadAsset(link, projectPath)
+			downloadAsset("img", link, projectPath)
 		})
 	}
 	// Wait for all wg.Go goroutines (they launch inner download goroutines via downloadWg).

@@ -20,6 +20,8 @@ func setEnvNoStub(t *testing.T, raw string) func() {
 	projectPath = t.TempDir()
 	crawlCtx = t.Context()
 	files = filesBase{}
+	runStats = newStats()
+	resetDefaultRewriter()
 	return func() {}
 }
 

@@ -3,8 +3,12 @@ package crawler
 import (
 	"context"
 	"net/url"
+	"path/filepath"
 	"slices"
 	"sync"
+
+	"github.com/shurco/goClone/pkg/manifest"
+	"github.com/shurco/goClone/pkg/netutil"
 )
 
 // Flags holds CLI-equivalent options for [CloneSite].
@@ -49,10 +53,96 @@ var (
 	// to respect cancellation. Defaults to Background for safety in tests.
 	crawlCtx = context.Background()
 
+	// man is the run manifest: the single source of truth for dedup (memory and disk).
+	// It stays nil in unit tests that exercise the old helpers directly.
+	man *manifest.Manifest
+
+	// runStats accumulates the end-of-run summary counters.
+	runStats stats
+
 	// downloadAsset schedules an asset download asynchronously. It is set by init() in
 	// init_download.go and may be replaced by tests. The function is goroutine-safe.
-	downloadAsset func(link, projectPath string)
+	downloadAsset func(kind, link, projectPath string)
 )
+
+// stats holds the summary counters printed at the end of a run.
+type stats struct {
+	mu sync.Mutex
+
+	pagesNew     int
+	pagesSkipped int
+	pagesFailed  int
+
+	assetsNew     map[string]int // kind -> newly downloaded
+	assetsSkipped map[string]int // kind -> skipped (success on disk or claimed in memory)
+	assetsFailed  map[string]int // kind -> failed
+}
+
+func newStats() stats {
+	return stats{
+		assetsNew:     make(map[string]int),
+		assetsSkipped: make(map[string]int),
+		assetsFailed:  make(map[string]int),
+	}
+}
+
+func (s *stats) pageNew() {
+	s.mu.Lock()
+	s.pagesNew++
+	s.mu.Unlock()
+}
+
+func (s *stats) pageSkipped() {
+	s.mu.Lock()
+	s.pagesSkipped++
+	s.mu.Unlock()
+}
+
+func (s *stats) pageFailed() {
+	s.mu.Lock()
+	s.pagesFailed++
+	s.mu.Unlock()
+}
+
+func (s *stats) assetNew(kind string) {
+	s.mu.Lock()
+	s.assetsNew[kind]++
+	s.mu.Unlock()
+}
+
+func (s *stats) assetSkipped(kind string) {
+	s.mu.Lock()
+	s.assetsSkipped[kind]++
+	s.mu.Unlock()
+}
+
+func (s *stats) assetFailed(kind string) {
+	s.mu.Lock()
+	s.assetsFailed[kind]++
+	s.mu.Unlock()
+}
+
+// snapshot returns consistent copies of every counter.
+func (s *stats) snapshot() (pagesNew, pagesSkipped, pagesFailed int, newN, skippedN, failedN int, failedByType map[string]int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	pagesNew, pagesSkipped, pagesFailed = s.pagesNew, s.pagesSkipped, s.pagesFailed
+	failedByType = make(map[string]int, len(s.assetsFailed))
+	if s.pagesFailed > 0 {
+		failedByType[manifest.TypePage] = s.pagesFailed
+	}
+	for _, n := range s.assetsNew {
+		newN += n
+	}
+	for _, n := range s.assetsSkipped {
+		skippedN += n
+	}
+	for kind, n := range s.assetsFailed {
+		failedN += n
+		failedByType[kind] = n
+	}
+	return
+}
 
 type filesBase struct {
 	pages []string
@@ -90,4 +180,35 @@ func addAsset(kind, link string) bool {
 	}
 	*list = append(*list, link)
 	return true
+}
+
+// manifestKind maps crawler asset kind names to manifest record types.
+func manifestKind(kind string) string {
+	switch kind {
+	case "css":
+		return manifest.TypeCSS
+	case "js":
+		return manifest.TypeJS
+	case "img":
+		return manifest.TypeImg
+	case "font":
+		return manifest.TypeFont
+	default:
+		return kind
+	}
+}
+
+// localRelPath computes the mirror-relative path of an asset URL, matching the layout
+// written by netutil.Extractor (e.g. "assets/img/img-a.png"). Returns "" for URLs whose
+// extension has no asset directory mapping.
+func localRelPath(kind, absLink string) string {
+	u, err := url.Parse(absLink)
+	if err != nil {
+		return ""
+	}
+	dir := netutil.Folders[kind]
+	if dir == "" {
+		return ""
+	}
+	return filepath.ToSlash(filepath.Join(dir, netutil.ReplaceSlashWithDash(u.Path)))
 }

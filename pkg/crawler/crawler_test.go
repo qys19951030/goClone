@@ -16,8 +16,10 @@ func withEnv(t *testing.T, raw string) func() {
 	projectPath = t.TempDir()
 	crawlCtx = t.Context()
 	files = filesBase{}
+	runStats = newStats()
+	resetDefaultRewriter()
 	old := downloadAsset
-	downloadAsset = func(link, projectPath string) {}
+	downloadAsset = func(kind, link, projectPath string) {}
 	return func() { downloadAsset = old }
 }
 
@@ -103,7 +105,7 @@ func Test_processSrcset_RewritesAll(t *testing.T) {
 	defer cleanup()
 	in := `<img srcset="/img/a.png 1x, /img/b.png 2x">`
 	body := in
-	out := processSrcset("/img/a.png 1x, /img/b.png 2x", body, func(s string) string { return projectURL.String() + s })
+	out := processSrcset(defaultRewriter, "/img/a.png 1x, /img/b.png 2x", body, func(s string) string { return projectURL.String() + s })
 	if out == body {
 		t.Fatalf("srcset not rewritten")
 	}
