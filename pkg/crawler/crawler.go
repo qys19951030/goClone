@@ -86,6 +86,9 @@ func cloneSite(ctx context.Context, args []string, flag Flags, summary *os.File)
 		return err
 	}
 	defer func() { man = nil }()
+	// A fatal manifest write cancels this derived context, stopping in-flight downloads
+	// instead of letting them keep producing records that can no longer be persisted.
+	crawlCtx = man.Context()
 
 	// Seed resume-run accounting from disk: every success record counts as a skip up
 	// front; items processed again below are added on top, so the two never overlap.
@@ -98,7 +101,7 @@ func cloneSite(ctx context.Context, args []string, flag Flags, summary *os.File)
 		case manifest.TypePage:
 			resumePages++
 		case manifest.TypeCSS, manifest.TypeJS, manifest.TypeImg, manifest.TypeFont:
-			runStats.assetSkipped(r.Type)
+			runStats.assetSkippedURL(r.Type, r.URL)
 		}
 	}
 	for range resumePages {
@@ -472,7 +475,7 @@ func scheduleCSS(g *geziyor.Geziyor, abs string) {
 	if man != nil {
 		if !man.Claim(abs) {
 			if man.IsSuccess(abs) {
-				runStats.assetSkipped("css")
+				runStats.assetSkippedURL("css", abs)
 				fmt.Fprintf(os.Stderr, "css skipped (already complete) --> %s\n", abs)
 			}
 			return

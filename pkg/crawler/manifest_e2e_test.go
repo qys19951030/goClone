@@ -485,6 +485,65 @@ func TestE2E_ManifestCumulativeCountOnlyGrows(t *testing.T) {
 	}
 }
 
+// TestE2E_SkipCountedOncePerURL proves resume seeding and page-parse skips never
+// double-count the same resource: the second-run skip total equals the distinct number
+// of successful assets on disk, not the number of HTML references to them.
+func TestE2E_SkipCountedOncePerURL(t *testing.T) {
+	var flaky atomic.Bool
+	ts := testSite(t, &flaky)
+	workdir := t.TempDir()
+
+	runCloneIn(t, workdir, ts.URL()+"/")
+	// /img/a.png is referenced three times in the mirror (index img, index inline CSS,
+	// the CSS file) but is exactly one distinct asset URL.
+	stdout, _ := runCloneIn(t, workdir, ts.URL()+"/")
+
+	// Distinct successful assets on disk: css, js, img/a.png, font = 4.
+	if !strings.Contains(stdout, "assets: new=0 skipped=4 failed=") {
+		t.Fatalf("each distinct asset skipped exactly once, got:\n%s", stdout)
+	}
+}
+
+// TestE2E_ManifestWriteFailureEndsRunFailed verifies that when the single writer can no
+// longer persist records, the failure surfaces as a non-nil run error rather than being
+// swallowed.
+func TestE2E_ManifestWriteFailureEndsRunFailed(t *testing.T) {
+	var flaky atomic.Bool
+	ts := testSite(t, &flaky)
+	workdir := t.TempDir()
+
+	prev, _ := os.Getwd()
+	if err := os.Chdir(workdir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(prev) })
+
+	// First run establishes a healthy manifest.
+	if err := CloneSite(context.Background(), []string{ts.URL() + "/"}, Flags{}); err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+
+	// Sabotage the manifest file so appends fail at write time.
+	mp := filepath.Join(workdir, urlHost(t, ts.URL()), ManifestFileName)
+	if err := os.Chmod(mp, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(mp, 0o666) })
+
+	// Root may bypass permission bits; in that case the directory-type preflight test
+	// already covers fail-closed behavior, so skip rather than assert a false negative.
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses file permission bits; covered by the directory-path preflight test")
+	}
+	err := CloneSite(context.Background(), []string{ts.URL() + "/"}, Flags{})
+	if err == nil {
+		t.Fatal("a manifest write failure must end the run with an error")
+	}
+	if !strings.Contains(err.Error(), "manifest") {
+		t.Fatalf("error should identify the manifest: %v", err)
+	}
+}
+
 func urlHost(t *testing.T, raw string) string {
 	t.Helper()
 	u, err := url.Parse(raw)

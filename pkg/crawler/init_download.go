@@ -44,7 +44,7 @@ func scheduleAsset(kind, link string) bool {
 	}
 	if !man.Claim(link) {
 		if man.IsSuccess(link) {
-			runStats.assetSkipped(kind)
+			runStats.assetSkippedURL(kind, link)
 		}
 		return false
 	}

@@ -76,6 +76,11 @@ type stats struct {
 	assetsNew     map[string]int // kind -> newly downloaded
 	assetsSkipped map[string]int // kind -> skipped (success on disk or claimed in memory)
 	assetsFailed  map[string]int // kind -> failed
+
+	// skippedURLs makes asset skip accounting idempotent: a URL already counted once
+	// (e.g. seeded from the manifest before the crawl) is never counted a second time
+	// when a re-parsed page encounters the same reference.
+	skippedURLs map[string]struct{}
 }
 
 func newStats() stats {
@@ -83,6 +88,7 @@ func newStats() stats {
 		assetsNew:     make(map[string]int),
 		assetsSkipped: make(map[string]int),
 		assetsFailed:  make(map[string]int),
+		skippedURLs:   make(map[string]struct{}),
 	}
 }
 
@@ -111,9 +117,21 @@ func (s *stats) assetNew(kind string) {
 }
 
 func (s *stats) assetSkipped(kind string) {
+	s.assetSkippedURL(kind, "")
+}
+
+// assetSkippedURL counts a skip at most once per URL; callers without a URL use
+// assetSkipped, which is counted unconditionally to preserve the old helper behavior.
+func (s *stats) assetSkippedURL(kind, url string) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if url != "" {
+		if _, ok := s.skippedURLs[url]; ok {
+			return
+		}
+		s.skippedURLs[url] = struct{}{}
+	}
 	s.assetsSkipped[kind]++
-	s.mu.Unlock()
 }
 
 func (s *stats) assetFailed(kind string) {
