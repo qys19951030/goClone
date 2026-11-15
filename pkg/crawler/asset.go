@@ -13,7 +13,7 @@ import (
 // It uses the package-default rewriter; page parsing should call saveAssetWith with a
 // per-page linkRewriter instead.
 func saveAsset(kind, absLink, original, body string) string {
-	return saveAssetWith(defaultRewriter, kind, absLink, original, body)
+	return saveAssetWith(currentRewriter(), kind, absLink, original, body)
 }
 
 // saveAssetWith is the per-page variant: it enforces that one page never maps a URL to

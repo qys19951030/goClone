@@ -33,7 +33,7 @@ func parseCSS(_ *geziyor.Geziyor, r *client.Response) {
 		recordCSS(cssURL, relPath, manifest.StatusFailed)
 		return
 	}
-	if _, err := fsutil.WriteOSFile(index, readCSSWith(defaultRewriter, body, body, r.Request.URL)); err != nil {
+	if _, err := fsutil.WriteOSFile(index, readCSSWith(currentRewriter(), body, body, r.Request.URL)); err != nil {
 		log.Printf("parseCSS: write %s: %v", name, err)
 		recordCSS(cssURL, relPath, manifest.StatusFailed)
 		return
@@ -62,7 +62,7 @@ func recordCSS(link, relPath, status string) {
 }
 
 func readCSS(data, body string, base *url.URL) string {
-	return readCSSWith(defaultRewriter, data, body, base)
+	return readCSSWith(currentRewriter(), data, body, base)
 }
 
 // readCSSWith rewrites same-site url(...) references, schedules font/img downloads via

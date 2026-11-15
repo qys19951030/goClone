@@ -105,7 +105,7 @@ func Test_processSrcset_RewritesAll(t *testing.T) {
 	defer cleanup()
 	in := `<img srcset="/img/a.png 1x, /img/b.png 2x">`
 	body := in
-	out := processSrcset(defaultRewriter, "/img/a.png 1x, /img/b.png 2x", body, func(s string) string { return projectURL.String() + s })
+	out := processSrcset(currentRewriter(), "/img/a.png 1x, /img/b.png 2x", body, func(s string) string { return projectURL.String() + s })
 	if out == body {
 		t.Fatalf("srcset not rewritten")
 	}

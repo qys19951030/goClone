@@ -84,6 +84,14 @@ var (
 	defaultRewriter   = newLinkRewriter()
 )
 
+// currentRewriter returns the package-default rewriter under its guard so test resets
+// cannot race with production reads.
+func currentRewriter() *linkRewriter {
+	defaultRewriterMu.Lock()
+	defer defaultRewriterMu.Unlock()
+	return defaultRewriter
+}
+
 func resetDefaultRewriter() {
 	defaultRewriterMu.Lock()
 	defer defaultRewriterMu.Unlock()
